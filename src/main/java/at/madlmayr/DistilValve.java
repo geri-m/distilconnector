@@ -6,6 +6,9 @@ import org.apache.catalina.valves.ValveBase;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 
+import javax.servlet.ServletException;
+import java.io.IOException;
+
 
 public class DistilValve extends ValveBase {
 
@@ -21,7 +24,7 @@ public class DistilValve extends ValveBase {
      */
 
     @Override
-    public void invoke(Request request, Response response) {
+    public void invoke(Request request, Response response) throws IOException, ServletException {
         long start = System.currentTimeMillis();
         log.info("Start " + start);
     }
