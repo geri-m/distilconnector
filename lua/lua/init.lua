@@ -24,10 +24,7 @@ local http = require "resty.http"
 
 local distil = require "distil.distil"
 
-local status, crypto = pcall(require, "distilcrypto")
-if not status then
-    ngx.log(ngx.INFO, "Failed to load distilcrypto. There will be no support for CAPTCHA on POST requests")
-end
+local crypto = require "distil.crypto"
 
 local function readall(filename)
     local fh, err = io.open(filename, "rb")
@@ -119,10 +116,10 @@ local SETTINGS = {
     analysis_host_port = 80;
     api_key_id = "debug-id";
     api_secret_key = "password";
-    challenge_path = "/6657193977244c13";
     debug_header_value = "debug-me";
-    integration_type = "openresty";
     token_encryption_key = "debug012345678901234567890123456789";
+    integration_type = "openresty";
+    challenge_path = "/6657193977244c13";
 }
 
 -- Functions needed by the Distil library.

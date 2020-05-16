@@ -476,7 +476,7 @@ end
 function Protection:_integration_info()
     return {
         instance_id = self._instance_id;
-        integration_library = "DIL-Lua 0.4.1 2019-12-05";
+        integration_library = "DIL-Lua 0.6 2020-05-12";
         integration_type = self._settings.integration_type;
         uptime_sec = now_sec() - self._start_time;
     }
