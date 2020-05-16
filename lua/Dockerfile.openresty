@@ -1,13 +1,11 @@
 FROM openresty/openresty:bionic
 
-RUN apt-get update && apt-get install -y \
-    git \
-    libsodium23 \
-    libssl-dev
+# Install OPM Dependencies
+RUN opm install ledgetech/lua-resty-http=0.14
+RUN opm install jkeys089/lua-resty-hmac=0.03
 
-RUN opm install pintsized/lua-resty-http
+# Install Luarocks Dependencies
+RUN /usr/local/openresty/luajit/bin/luarocks install lua-zlib 1.2-0
 
-ADD distilcrypto/libdistilcrypto.so /usr/lib
-ADD distilcrypto/distilcrypto.lua /usr/local/openresty/site/lualib
 ADD lua /usr/local/openresty/site/lualib/distil
 ADD conf.d/default.conf /etc/nginx/conf.d/default.conf
