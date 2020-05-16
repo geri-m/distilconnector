@@ -1,9 +1,3 @@
---[[
-CHANGELOG:
-
-2019-04-24: Improve metrics
---]]
-
 local BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
 local function base64_encode(data)
@@ -25,6 +19,15 @@ local function base64_encode(data)
     end)..({ '', '==', '=' })[#data % 3 + 1])
 end
 
+local function split_token(token)
+    local t = {}
+    for v in string.gmatch(token, "([^:]+)") do
+        t[#t + 1] = v
+    end
+
+    return t
+end
+
 -------------------------------------------------------------------------------
 
 local function is_status_success(status)
@@ -33,6 +36,29 @@ end
 
 local function is_status_timeout(status)
     return status == 504
+end
+
+local function should_lead_to_throttling(status)
+    if type(status) ~= "number" then
+        return true
+    end
+
+    -- Internal errors
+    if status >= 500 then return true end
+
+    -- Unauthorized
+    if status == 401 then return true end
+
+    -- Forbidden
+    if status == 403 then return true end
+
+    -- Request Timeout
+    if status == 408 then return true end
+
+    -- Too Many Requests
+    if status == 429 then return true end
+
+    return false
 end
 
 local THROTTLED_ERROR = "Throttled"
@@ -50,7 +76,7 @@ The goal is to globally minimize latency while returning fast from downtime.
 --]]
 local function healthcheck_fetch(inner_fetch)
     local HEALTHY_THRESHOLD = 5
-    local UNHEALTHY_THRESHOLD = 2
+    local UNHEALTHY_THRESHOLD = 3
     local MIN_ATTEMPT_PROBABILITY = 0.01
     local RECOVERY_ATTEMPT_PROBABILITY = 0.1
 
@@ -66,14 +92,14 @@ local function healthcheck_fetch(inner_fetch)
 
         local status, body = inner_fetch(host, port, request)
 
-        if is_status_success(status) then
-            consecutive_successful_requests = consecutive_successful_requests + 1
-            consecutive_failed_requests = 0
-            current_attempt_probability = RECOVERY_ATTEMPT_PROBABILITY
-        else
+        if should_lead_to_throttling(status) then
             consecutive_successful_requests = 0
             consecutive_failed_requests = consecutive_failed_requests + 1
             current_attempt_probability = MIN_ATTEMPT_PROBABILITY
+        else
+            consecutive_successful_requests = consecutive_successful_requests + 1
+            consecutive_failed_requests = 0
+            current_attempt_probability = RECOVERY_ATTEMPT_PROBABILITY
         end
 
         if consecutive_failed_requests >= UNHEALTHY_THRESHOLD then
@@ -124,6 +150,13 @@ end
 
 -------------------------------------------------------------------------------
 
+-- os.clock() only has has 10ms granularity
+-- ngx.now() has millisecond granularity
+-- ngx.now returns a cached Nginx time. Hopefully it is updated by the fetch.
+local now_sec = ngx and ngx.now or os.clock
+
+-------------------------------------------------------------------------------
+
 local Protection = {}
 
 --[[
@@ -136,7 +169,10 @@ settings: {
     analysis_host_port = 443;
     api_key_id = "api-key-id-uuid";
     api_secret_key = "api-secret-key-base64";
+    challenge_path = "/6657193977244c13";
+    debug_header_value = "debug-me";
     integration_type = "openresty, vdms, or similar";
+    token_encryption_key = "debug012345678901234567890123456789";
 }
 
 -- This is methods used by the Distil library that you will need to supply:
@@ -156,32 +192,44 @@ libs: {
     -- What does the json library use to represent null values?
     -- (e.g. cjson.null)
     json_null = nil;
+
+    -- How do we encrypt data?
+    -- function(string, string) -> { iv: string, hmac: string, payload: string }
+    encrypt = function(data, key) ... end;
+
+    -- How do we decrypt data?
+    -- function({ iv: string, hmac: string, payload: string }, string) -> string
+    decrypt = function(encrypted, key) ... end;
 }
 --]]
 function Protection:new(settings, libs)
     local protection = {
-        _analysis_path = "/v5/analysis";
+        _analysis_path = "/v6/analysis";
         _instance_id = settings.integration_type .. "-" .. os.date("!%Y-%m-%dT%H:%M:%S") .. "-" .. math.random(1000000000);
         _libs = {
             fetch = healthcheck_fetch(libs.fetch);
             json_decode = libs.json_decode;
             json_encode = libs.json_encode;
             json_null = libs.json_null;
+            encrypt = libs.encrypt;
+            decrypt = libs.decrypt;
         };
         _settings = settings;
-        _start_time = os.clock();
+        _start_time = now_sec();
         _statistics = Statistics:new();
     }
     return setmetatable(protection, { __index = Protection })
 end
 
 --[[
+Ask the Distil edge to analyze the request
+
 client_ip: a string with the IP
 raw_request: a string with the raw request excluding the body but including the \r\n\r\n before the body
 request_id: optional string which uniquely identifies this request
 
 Returns either an analysis or nil, error
-Analysis: { action: string or nil; tags: [string]; }
+Analysis: { action: string or nil; tags: [string]; flags: [string]; }
 --]]
 function Protection:remote_analyze(client_ip, raw_request, request_id)
     local analysis_request = {
@@ -197,7 +245,7 @@ function Protection:remote_analyze(client_ip, raw_request, request_id)
 
     local request = {
         method = "POST";
-        path = "/v5/analysis";
+        path = "/v6/analysis";
         headers = {
             ["Authorization"] = "Basic " .. base64_encode(self._settings.api_key_id .. ":" .. self._settings.api_secret_key);
             ["Content-Length"] = body:len();
@@ -206,14 +254,14 @@ function Protection:remote_analyze(client_ip, raw_request, request_id)
         body = body;
     }
 
-    local start_clock = os.clock()
+    local start_clock = now_sec()
     local status, body = self._libs.fetch(self._settings.analysis_host, self._settings.analysis_host_port, request)
-    local latency_milli_sec = 1000.0 * (os.clock() - start_clock)
+    local latency_milli_sec = 1000.0 * (now_sec() - start_clock)
 
     if status == 200 then
         table.insert(self._statistics.success_latency_ms, latency_milli_sec)
     else
-        -- The statistics didn't make it to bon, so save them again so we can resend them later:
+        -- The statistics didn't make it to Distil, so save them again so we can resend them later:
         self._statistics:add_stats(analysis_request.statistics)
 
         if status == nil and body == THROTTLED_ERROR then
@@ -225,43 +273,354 @@ function Protection:remote_analyze(client_ip, raw_request, request_id)
         end
     end
 
-    return self:_as_analysis(status, body)
-end
-
-function Protection:_as_analysis(status, body)
     if not is_status_success(status) then
         return nil, "fetch(): " .. (body or "UNKNOWN ERROR")
     end
 
+    return self:_as_analysis(body)
+end
+
+--[[
+Extract an analysis from the Distil token, which may or may not be present.
+
+cookies: A table of the cookies present in the request
+
+Returns an analysis or nil, error
+Analysis: { action: string or nil; tags: [string]; flags: [string]; }
+--]]
+function Protection:extract_analysis_from_token(cookies)
+    if self._libs.decrypt == nil then
+        return nil, "Decryption support is required for decrypting tokens but is unavailable"
+    end
+
+    local token = cookies["reese84"]
+    if token == nil then
+        return nil, nil
+    end
+
+    local token_parts = split_token(token)
+    local iv = token_parts[2]
+    if iv == nil then
+        return nil, "Malformed token (missing IV)"
+    end
+
+    local payload = token_parts[3]
+    if payload == nil then
+        return nil, "Malformed token (missing payload)"
+    end
+
+    local hmac = token_parts[4]
+    if hmac == nil then
+        return nil, "Malformed hmac"
+    end
+
+    local encrypted = {
+        iv = iv;
+        hmac = hmac;
+        payload = payload;
+    }
+
+    local decrypted_token, err = self._libs.decrypt(encrypted, self._settings.token_encryption_key)
+    if decrypted_token == nil then
+        return nil, "Failed to decrypt token: " .. err
+    end
+
+    return self:_as_analysis(decrypted_token)
+end
+
+--[[
+Fetch a captcha or identify interstitial from the Distil edge.
+
+action: The action returned from the analysis call. Either captcha or identify.
+interstitial_request: { method: string; headers: table; client_ip: string; formdata: string or nil }
+
+Returns content, err
+--]]
+function Protection:fetch_interstitial(analysis, interstitial_request, template)
+    local action = analysis.action
+    if action ~= "captcha" and action ~= "identify" then
+        return nil, "Unsupported interstitial action: " .. action
+    end
+
+    -- request should contain method, headers, client_ip, formdata
+    local host = interstitial_request.headers["Host"]
+
+    local fetch_request = {
+        method = interstitial_request.method;
+        path = "/v6/" .. action .. "/" .. self._settings.api_key_id .. self._settings.challenge_path;
+        headers = {
+            ["x-d-tags"] = table.concat(analysis.tags, ",");
+            ["x-d-condition-ids"] = table.concat(analysis.deciding_condition_ids, ",");
+            ["X-Forwarded-Host"] = host;
+            ["X-Forwarded-For"] = interstitial_request.client_ip;
+            ["Content-Type"] = "application/x-www-form-urlencoded";
+            ["Accept"] = "application/json";
+        };
+    }
+
+    local status, content = self._libs.fetch(self._settings.analysis_host, self._settings.analysis_host_port, fetch_request)
+    if status == nil then
+        return nil, "Failed to fetch interstitial: " .. content
+    end
+
+    local interstitial_data, err = self._libs.json_decode(content)
+    if interstitial_data == nil then
+        return nil, "Failed to parse insterstitial data: " .. err
+    end
+
+    local response = {}
+    response["status"] = status
+
+    if interstitial_request.method == "POST" then
+        if interstitial_request.headers["Content-Type"] ~= "application/x-www-form-urlencoded" then
+            return nil, "identify/captcha on POST requests can only be done for form requests"
+        end
+
+        if self._libs.encrypt == nil then
+            return nil, "Encryption support is required for processing POST requests but is unavailable"
+        end
+
+        local encrypted, err = self._libs.encrypt(interstitial_request.formdata, self._settings.token_encryption_key)
+
+        interstitial_data.body = interstitial_data.body:gsub("__ENCRYPTED_REQUEST_BODY__", encrypted.payload)
+        response["cookie"] = "reese84-resubmit-token=" .. encrypted.iv .. ":" .. encrypted.hmac .. "; HttpOnly; Max-Age=60"
+    end
+
+    content = self:render_interstitial(template, interstitial_data)
+
+    response["content"] = content
+
+    return response, nil
+end
+
+function Protection:render_interstitial(template, data)
+    for k, v in pairs(data) do
+        local substitution = "{{{? *" .. k .. " *}?}}"
+        template = template:gsub(substitution, data[k])
+    end
+
+    return template
+end
+
+--[[
+Decrypt an encrypted post payload
+
+resubmit_token: The token, as derived from a cookie
+resubmit_data: The payload, extracted from form data
+
+Returns a string of decrypted data, err
+--]]
+function Protection:decrypt_resubmitted_data(resubmit_token, resubmit_data)
+    if self._libs.decrypt == nil then
+        return nil, "Decryption support is required for processing POST payloads, but is unavailable"
+    end
+
+    local token_parts = split_token(resubmit_token)
+    local iv = token_parts[1]
+    if iv == nil then
+        return nil, "Malformed resubmit token (missing IV)"
+    end
+
+    local hmac = token_parts[2]
+    if hmac == nil then
+        return nil, "Malformed resubmit token (missing HMAC)"
+    end
+
+    local encrypted = {
+        iv = iv;
+        hmac = hmac;
+        payload = resubmit_data;
+    }
+
+    local decrypted, err = self._libs.decrypt(encrypted, self._settings.token_encryption_key)
+    if decrypted == nil then
+        return nil, "Failed to decrypt: " .. err
+    end
+
+    return decrypted, nil
+end
+
+local function is_analysis(analysis)
+    if analysis.action ~= nil and type(analysis.action) ~= "string" then return false end
+    if analysis.flags ~= nil and type(analysis.flags) ~= "table" then return false end
+    if analysis.tags ~= nil and type(analysis.tags) ~= "table" then return false end
+    if analysis.deciding_condition_ids ~= nil and type(analysis.deciding_condition_ids) ~= "table" then return false end
+    return true
+end
+
+function Protection:_as_analysis(body)
     local analysis, err = self._libs.json_decode(body)
     if not analysis then
         return nil, err or "JSON decode error"
     end
 
-    if analysis.action == self._libs.json_null then
-        analysis.action = nil
-    end
+    local json_null = self._libs.json_null
 
-    local is_analysis = (analysis.action == nil or type(analysis.action) == "string") and type(analysis.tags) == "table"
-    if not is_analysis then
+    if analysis.action == json_null then analysis.action = nil end
+    if analysis.flags == json_null then analysis.flags = nil end -- shouldn't happen, but nice to be future proof
+    if analysis.tags == json_null then analysis.tags = {} end -- shouldn't happen, but nice to be future proof
+    if analysis.deciding_condition_ids == json_null then analysis.deciding_condition_ids = {} end -- shouldn't happen, but nice to be future proof
+
+    if not is_analysis(analysis) then
         return nil, "Not an analysis"
     end
 
     return {
         action = analysis.action;
+        flags = analysis.flags;
         tags = analysis.tags;
+        deciding_condition_ids = analysis.deciding_condition_ids;
     }
 end
 
 function Protection:_integration_info()
     return {
         instance_id = self._instance_id;
-        integration_library = "LIL";
+        integration_library = "DIL-Lua 0.4.1 2019-12-05";
         integration_type = self._settings.integration_type;
-        uptime_sec = os.clock() - self._start_time;
+        uptime_sec = now_sec() - self._start_time;
     }
 end
 
-return {
+-- Safe set of headers which we can send to bon without needing to mask the contents as they could contain
+-- passwords, API Keys, personal information etc
+local safe_whitelist_headers = {
+    ["accept"] = true,
+    ["accept-charset"] = true,
+    ["accept-encoding"] = true,
+    ["accept-language"] = true,
+    ["cf-connecting-ip"] = true,
+    ["cache-control"] = true,
+    ["connection"] = true,
+    ["content-length"] = true,
+    ["content-type"] = true,
+    ["host"] = true,
+    ["referer"] = true,
+    ["user-agent"] = true,
+    ["x-forwarded-for"] = true,
+    ["x-forwarded-host"] = true,
+    ["x-forwarded-proto"] = true,
+    ["x-real-ip"] = true,
+}
+
+-- By default we want to mask any standard authorization headers so we don't send any access tokens
+-- or username/passwords
+local default_header_mask = {
+    ["authorization"] = true,
+    ["proxy-authenticate"] = true,
+    ["proxy-authorization"] = true,
+    ["www-authenticate"] = true,
+}
+
+local distil_whitelist_headers = {
+    ["x-d-action"] = true,
+    ["x-d-domain"] = true,
+    ["x-d-test"] = true,
+    ["x-d-token"] = true,
+    ["x-distil-challenge"] = true,
+    ["x-distil-debug"] = true,
+}
+
+-- These must be plain text no matter what or connector will mark the requests as bots
+local distil_whitelist_cookies = {
+    ["reese84"] = true,
+    ["reese84-resubmit-token"] = true,
+    ["x-d-token"] = true,
+}
+
+local function mask(value)
+    return value:gsub("[^,%s]", "X")
+end
+
+-- https://stackoverflow.com/a/19329565
+local function lines(s)
+    if s:sub(-1) ~= "\n" then
+        s = s.."\n"
+    end
+    return s:gmatch("(.-[\r\n]+)")
+end
+
+local M = {
     Protection = Protection;
 }
+
+local function trim(s)
+   return s:match( "^%s*(.-)%s*$" )
+end
+
+-- Given the contents of the cookie header,
+-- return a table mapping cookie keys to their values.
+-- You can pass in either a string (single cookie header)
+-- or a list of strings (multiple cookie headers).
+-- nil results in an empty list.
+function M.cookie_table(cookies)
+    local t = {}
+    M.parse_cookies(cookies, function (key, value)
+        t[trim(key)] = trim(value)
+    end)
+    return t
+end
+
+function M.parse_cookies(cookies, consumer)
+    if cookies == nil then
+        return
+    end
+
+    if type(cookies) == "table" then
+        for _, line in ipairs(cookies) do
+            for k, v, sep in string.gmatch(line, "([^=]*)=([^;]*)(;?)") do
+                consumer(k, v, sep)
+            end
+        end
+    else
+        for k, v, sep in string.gmatch(cookies, "([^=]*)=([^;]*)(;?)") do
+            consumer(k, v, sep)
+        end
+    end
+end
+
+local function mask_header(name)
+    return default_header_mask[name]
+end
+
+function M.mask_header(name, value)
+    local lowerName = name:lower()
+
+    if distil_whitelist_headers[lowerName] then
+        return value
+    end
+
+    if lowerName == "cookie" then
+        local values = {}
+        local cookies = M.parse_cookies(value, function (key, cookieValue, sep)
+            local lowerKey = trim(key):lower()
+            if not distil_whitelist_cookies[lowerKey] then
+                cookieValue = mask(cookieValue)
+            end
+            table.insert(values, key.."="..cookieValue..sep)
+        end)
+        return table.concat(values, "")
+    end
+
+    if mask_header(lowerName) then
+        return mask(value)
+    end
+
+    return value
+end
+
+function M.mask_raw_headers(raw_headers)
+    local output = {}
+    for line in lines(raw_headers) do
+        if #output == 0 then
+            table.insert(output, line) -- leave the request line alone
+        else
+            for name, space, value, eol in line:gmatch("([^:%s]+)(%s*:%s*)([^\r\n]*)([\r\n]+)") do
+                table.insert(output, name..space..M.mask_header(name, value)..eol)
+            end
+        end
+    end
+    return table.concat(output, "")
+end
+
+return M

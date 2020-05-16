@@ -1,0 +1,28 @@
+# Example for ubuntu 18.04 with standard nginx and lua module, without full openresty
+FROM ubuntu:18.04
+
+RUN apt-get update && apt-get install -y \
+    nginx \
+    libnginx-mod-http-lua \
+    lua-cjson
+
+RUN rm /etc/nginx/nginx.conf
+RUN rm /etc/nginx/sites-available/default
+RUN rm /etc/nginx/sites-enabled/default
+
+ADD distilcrypto/libdistilcrypto.so /usr/lib
+RUN mkdir /usr/share/nginx/lua
+ADD lua /usr/share/nginx/lua/distil
+ADD \
+    thirdparty/resty \
+    distilcrypto/distilcrypto.lua \
+    /usr/share/nginx/lua/
+ADD ubuntu/nginx.conf /etc/nginx/
+ADD conf.d/default.conf /etc/nginx/sites-available/default
+RUN ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+
+RUN sed -i -e 's#/usr/local/openresty/site/lualib/distil#/usr/share/nginx/lua/distil#' /etc/nginx/sites-available/default
+
+EXPOSE 80
+
+CMD ["/usr/sbin/nginx", "-g", "daemon off;"]

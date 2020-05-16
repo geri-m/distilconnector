@@ -1,0 +1,27 @@
+# Example for centos 7 with standard nginx and lua module, without full openresty
+FROM centos:7
+
+RUN yum install -y epel-release && \
+    yum install -y http://nginx.org/packages/centos/7/noarch/RPMS/nginx-release-centos-7-0.el7.ngx.noarch.rpm && \
+    sed -i -e 's@/packages/@/packages/mainline/@' /etc/yum.repos.d/nginx.repo && \
+    curl -L https://copr.fedorainfracloud.org/coprs/khara/nginx-module-ndk-lua/repo/epel-7/khara-nginx-module-ndk-lua-epel-7.repo -o /etc/yum.repos.d/nginx-module-ndk-lua.repo && \
+    yum install -y nginx:1.15.7 nginx-module-lua lua-json libsodium libssl
+
+RUN rm /etc/nginx/nginx.conf
+RUN rm /etc/nginx/conf.d/default.conf
+
+ADD distilcrypto/libdistilcrypto.so /usr/lib64
+RUN mkdir /usr/share/nginx/lua
+ADD lua /usr/share/nginx/lua/distil
+ADD \
+    thirdparty/resty \
+    distilcrypto/distilcrypto.lua \
+    /usr/share/nginx/lua/
+ADD centos/nginx.conf /etc/nginx/nginx.conf
+ADD conf.d/default.conf /etc/nginx/conf.d/default.conf
+
+RUN sed -i -e 's#/usr/local/openresty/site/lualib/distil#/usr/share/nginx/lua/distil#' /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["/usr/sbin/nginx", "-g", "daemon off;"]
